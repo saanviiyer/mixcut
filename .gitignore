@@ -1,0 +1,13 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+work/
+output/
+uploads/
+*.wav
+*.mp3
+*.aiff
+.DS_Store
+*.egg-info/
