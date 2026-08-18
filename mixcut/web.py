@@ -9,13 +9,17 @@ Run:  uvicorn mixcut.web:app --reload
 from __future__ import annotations
 
 import json
+import asyncio
+import math
 import os
 import shutil
 import tempfile
+import time
 import uuid
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from starlette.concurrency import run_in_threadpool
 
 from .analysis import analyze
 from .render import render_cut, write_outputs
@@ -29,6 +33,9 @@ WORK_DIR = os.environ.get(
 os.makedirs(WORK_DIR, exist_ok=True)
 
 app = FastAPI(title="mixcut")
+MAX_CONCURRENT_JOBS = max(1, int(os.environ.get("MIXCUT_MAX_CONCURRENT_JOBS", "2")))
+JOB_TTL_SECONDS = max(300, int(os.environ.get("MIXCUT_JOB_TTL_SECONDS", "3600")))
+JOB_SLOTS = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
 # job_id -> {"input": path, "analysis": dict}
 JOBS: dict[str, dict] = {}
@@ -40,6 +47,29 @@ def _job_dir(job_id: str) -> str:
     return d
 
 
+def _cleanup_expired_jobs() -> None:
+    cutoff = time.time() - JOB_TTL_SECONDS
+    expired = [job_id for job_id, job in JOBS.items()
+               if job.get("created_at", 0) < cutoff]
+    for job_id in expired:
+        JOBS.pop(job_id, None)
+        shutil.rmtree(os.path.join(WORK_DIR, job_id), ignore_errors=True)
+
+
+@app.middleware("http")
+async def security_headers(request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    return response
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     return INDEX_HTML
@@ -47,6 +77,7 @@ def index() -> str:
 
 @app.post("/analyze")
 async def analyze_endpoint(file: UploadFile = File(...)):
+    _cleanup_expired_jobs()
     ext = os.path.splitext(file.filename or "")[1].lower()
     if ext not in ALLOWED_EXT:
         raise HTTPException(400, f"Unsupported file type {ext!r}. "
@@ -69,11 +100,17 @@ async def analyze_endpoint(file: UploadFile = File(...)):
             f.write(chunk)
 
     try:
-        a = analyze(in_path)
+        async with JOB_SLOTS:
+            a = await run_in_threadpool(analyze, in_path)
     except Exception as e:
-        raise HTTPException(500, f"Analysis failed: {e}")
+        shutil.rmtree(jd, ignore_errors=True)
+        raise HTTPException(500, "Analysis failed for this audio file.") from e
 
-    JOBS[job_id] = {"input": in_path, "analysis": a.to_dict()}
+    JOBS[job_id] = {
+        "input": in_path,
+        "analysis": a.to_dict(),
+        "created_at": time.time(),
+    }
     payload = {"job_id": job_id, **a.to_dict()}
     return JSONResponse(payload)
 
@@ -90,22 +127,34 @@ async def render_endpoint(
     if not job:
         raise HTTPException(404, "Unknown job_id (re-upload).")
     a = job["analysis"]
+    duration = float(a["duration"])
+    values = (remove_start, remove_end, crossfade_bars, crossfade_seconds)
+    if not all(math.isfinite(value) for value in values):
+        raise HTTPException(400, "Render parameters must be finite numbers.")
+    if remove_start < 0 or remove_end > duration or remove_end <= remove_start:
+        raise HTTPException(400, "Removal span must be ordered and inside the track.")
+    if crossfade_bars < 0 or crossfade_bars > 16 or crossfade_seconds < 0 or crossfade_seconds > 30:
+        raise HTTPException(400, "Crossfade setting is outside the supported range.")
     jd = _job_dir(job_id)
     out_base = os.path.join(jd, "mixcut_out")
     try:
-        result = render_cut(
-            job["input"],
-            remove_start=remove_start,
-            remove_end=remove_end,
-            crossfade_seconds=crossfade_seconds,
-            crossfade_bars=crossfade_bars,
-            tempo=a["tempo"],
-            beats_per_bar=a.get("beats_per_bar", 4),
-        )
-    except Exception as e:
-        raise HTTPException(400, f"Render failed: {e}")
+        def render_and_write():
+            rendered = render_cut(
+                job["input"],
+                remove_start=remove_start,
+                remove_end=remove_end,
+                crossfade_seconds=crossfade_seconds,
+                crossfade_bars=crossfade_bars,
+                tempo=a["tempo"],
+                beats_per_bar=a.get("beats_per_bar", 4),
+            )
+            return rendered, write_outputs(rendered, out_base)
 
-    outs = write_outputs(result, out_base)
+        async with JOB_SLOTS:
+            result, outs = await run_in_threadpool(render_and_write)
+    except Exception as e:
+        raise HTTPException(400, "Render failed for the requested span.") from e
+
     return JSONResponse({
         "job_id": job_id,
         "orig_duration": round(result.orig_duration, 3),
@@ -120,11 +169,11 @@ async def render_endpoint(
 
 @app.get("/file/{job_id}/{name}")
 def get_file(job_id: str, name: str):
-    jd = _job_dir(job_id)
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Unknown job.")
+    jd = os.path.join(WORK_DIR, job_id)
     if name == "input":
-        job = JOBS.get(job_id)
-        if not job:
-            raise HTTPException(404, "Unknown job.")
         return FileResponse(job["input"])
     mapping = {"out.wav": "mixcut_out.wav", "out.mp3": "mixcut_out.mp3"}
     fname = mapping.get(name)

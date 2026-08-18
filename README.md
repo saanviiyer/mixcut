@@ -78,6 +78,20 @@ Then open **http://127.0.0.1:8000** (uvicorn's default host/port). Upload a song
 
 Uploads and rendered outputs are stored in a per-job work directory (default: your system temp dir under `mixcut_work/`; override with `MIXCUT_WORK`). Upload size is capped at 40 MB.
 
+### Production deployment
+
+`Dockerfile` includes the Python runtime, ffmpeg, and libsndfile. `render.yaml`
+deploys it as a single-worker service with a `/health` check. Analysis and
+rendering run in a bounded thread pool so CPU-heavy DSP does not block the
+request loop; old job files expire after one hour by default. Tune
+`MIXCUT_MAX_CONCURRENT_JOBS`, `MIXCUT_JOB_TTL_SECONDS`, and `MIXCUT_WORK` for
+the host's CPU and persistent-storage policy.
+
+```bash
+docker build -t mixcut .
+docker run --rm -p 8000:8000 mixcut
+```
+
 ---
 
 ## Verify (synthetic fixture, no copyrighted audio)

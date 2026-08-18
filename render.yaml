@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: mixcut
+    runtime: docker
+    healthCheckPath: /health
+    envVars:
+      - key: MIXCUT_MAX_CONCURRENT_JOBS
+        value: "2"
+      - key: MIXCUT_JOB_TTL_SECONDS
+        value: "3600"
